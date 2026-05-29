@@ -1,0 +1,13 @@
+{
+  "image": "stamp_1.png",
+  "output": "stamp_1.stl",
+  "width_mm": 50,
+  "base_height_mm": 6,
+  "relief_height_mm": 5,
+  "threshold": 245,
+  "max_resolution": 256,
+  "sample_mode": "majority",
+  "invert": false,
+  "mirror": true,
+  "ascii_stl": false
+}
