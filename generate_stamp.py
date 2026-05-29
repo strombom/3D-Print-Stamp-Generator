@@ -47,7 +47,9 @@ class StampConfig:
     config_path: Path
     image_path: Path
     output_path: Path
-    width_mm: float
+    stamp_height_mm: float
+    base_mode: str
+    outline_mm: float
     base_height_mm: float
     relief_height_mm: float
     threshold: int
@@ -56,6 +58,17 @@ class StampConfig:
     invert: bool
     mirror: bool
     ascii_stl: bool
+
+
+@dataclass(frozen=True)
+class PreparedMasks:
+    relief: MaskData
+    base: MaskData
+    outline_cells: int
+    actual_outline_mm: float
+    white_extents: tuple[int, int, int, int] | None
+    artwork_width_cells: int
+    artwork_height_cells: int
 
 
 @dataclass
@@ -87,7 +100,9 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
 
 CONFIG_DEFAULTS: Mapping[str, Any] = {
-    "width_mm": 50.0,
+    "stamp_height_mm": 50.0,
+    "base_mode": "image",
+    "outline_mm": 0.0,
     "base_height_mm": 6.0,
     "relief_height_mm": 2.0,
     "threshold": 245,
@@ -100,6 +115,7 @@ CONFIG_DEFAULTS: Mapping[str, Any] = {
 
 CONFIG_FIELDS = {"image", "output", *CONFIG_DEFAULTS.keys()}
 SAMPLE_MODES = {"majority", "any", "center"}
+BASE_MODES = {"image", "extents", "contour"}
 
 
 def load_stamp_config(config_path: Path) -> StampConfig:
@@ -137,11 +153,18 @@ def load_stamp_config(config_path: Path) -> StampConfig:
         allowed = ", ".join(sorted(SAMPLE_MODES))
         raise SystemExit(f"{config_path}: field `sample_mode` must be one of: {allowed}.")
 
+    base_mode = raw_config.get("base_mode", CONFIG_DEFAULTS["base_mode"])
+    if base_mode not in BASE_MODES:
+        allowed = ", ".join(sorted(BASE_MODES))
+        raise SystemExit(f"{config_path}: field `base_mode` must be one of: {allowed}.")
+
     return StampConfig(
         config_path=config_path,
         image_path=image_path,
         output_path=output_path,
-        width_mm=config_positive_float(config_path, raw_config, "width_mm"),
+        stamp_height_mm=config_positive_float(config_path, raw_config, "stamp_height_mm"),
+        base_mode=str(base_mode),
+        outline_mm=config_non_negative_float(config_path, raw_config, "outline_mm"),
         base_height_mm=config_positive_float(config_path, raw_config, "base_height_mm"),
         relief_height_mm=config_positive_float(config_path, raw_config, "relief_height_mm"),
         threshold=config_threshold(config_path, raw_config),
@@ -170,6 +193,19 @@ def config_positive_float(config_path: Path, config: Mapping[str, Any], field: s
         raise SystemExit(f"{config_path}: field `{field}` must be a number greater than 0.") from exc
     if parsed <= 0:
         raise SystemExit(f"{config_path}: field `{field}` must be greater than 0.")
+    return parsed
+
+
+def config_non_negative_float(config_path: Path, config: Mapping[str, Any], field: str) -> float:
+    value = config.get(field, CONFIG_DEFAULTS[field])
+    try:
+        if isinstance(value, bool):
+            raise ValueError
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(f"{config_path}: field `{field}` must be a number 0 or greater.") from exc
+    if parsed < 0:
+        raise SystemExit(f"{config_path}: field `{field}` must be 0 or greater.")
     return parsed
 
 
@@ -419,6 +455,142 @@ def build_mask(
     return MaskData(mask_width, mask_height, rows, image.width, image.height)
 
 
+def prepare_masks(mask: MaskData, base_mode: str, outline_mm: float, stamp_height_mm: float) -> PreparedMasks:
+    white_extents = find_mask_extents(mask.pixels)
+    if white_extents is None:
+        raise SystemExit("No raised pixels were detected. Adjust `threshold`, `invert`, or the input image.")
+
+    row0, row1, col0, col1 = white_extents
+    artwork_width_cells = col1 - col0
+    artwork_height_cells = row1 - row0
+
+    if base_mode == "image":
+        if outline_mm > 0:
+            raise SystemExit("`outline_mm` only applies when `base_mode` is `extents` or `contour`.")
+        return PreparedMasks(
+            relief=mask,
+            base=filled_mask(mask.width, mask.height, 1, mask),
+            outline_cells=0,
+            actual_outline_mm=0.0,
+            white_extents=white_extents,
+            artwork_width_cells=artwork_width_cells,
+            artwork_height_cells=artwork_height_cells,
+        )
+
+    outline_cells = outline_mm_to_cells(outline_mm, stamp_height_mm, artwork_height_cells)
+    relief = extract_mask_with_outline(mask, white_extents, outline_cells)
+
+    if base_mode == "extents":
+        base = filled_mask(relief.width, relief.height, 1, relief)
+    elif base_mode == "contour":
+        base = MaskData(
+            relief.width,
+            relief.height,
+            dilate_mask(relief.pixels, outline_cells),
+            relief.source_width,
+            relief.source_height,
+        )
+    else:
+        raise SystemExit(f"Unsupported base mode: {base_mode}.")
+
+    mm_per_cell = stamp_height_mm / artwork_height_cells
+    actual_outline_mm = outline_cells * mm_per_cell
+    return PreparedMasks(
+        relief=relief,
+        base=base,
+        outline_cells=outline_cells,
+        actual_outline_mm=actual_outline_mm,
+        white_extents=white_extents,
+        artwork_width_cells=artwork_width_cells,
+        artwork_height_cells=artwork_height_cells,
+    )
+
+
+def filled_mask(width: int, height: int, value: int, source: MaskData) -> MaskData:
+    fill = 1 if value else 0
+    return MaskData(
+        width,
+        height,
+        [bytearray([fill]) * width for _row in range(height)],
+        source.source_width,
+        source.source_height,
+    )
+
+
+def find_mask_extents(rows: Sequence[bytearray]) -> tuple[int, int, int, int] | None:
+    row0: int | None = None
+    row1 = 0
+    col0: int | None = None
+    col1 = 0
+
+    for row_index, row in enumerate(rows):
+        for col_index, value in enumerate(row):
+            if not value:
+                continue
+            if row0 is None:
+                row0 = row_index
+            row1 = row_index + 1
+            col0 = col_index if col0 is None else min(col0, col_index)
+            col1 = max(col1, col_index + 1)
+
+    if row0 is None or col0 is None:
+        return None
+    return row0, row1, col0, col1
+
+
+def outline_mm_to_cells(outline_mm: float, stamp_height_mm: float, artwork_height_cells: int) -> int:
+    if outline_mm <= 0:
+        return 0
+
+    ideal_cells = outline_mm * artwork_height_cells / stamp_height_mm
+    return max(1, round(ideal_cells))
+
+
+def extract_mask_with_outline(
+    mask: MaskData,
+    extents: tuple[int, int, int, int],
+    outline_cells: int,
+) -> MaskData:
+    row0, row1, col0, col1 = extents
+    output_width = (col1 - col0) + (2 * outline_cells)
+    output_height = (row1 - row0) + (2 * outline_cells)
+    rows = [bytearray(output_width) for _row in range(output_height)]
+
+    for source_row in range(row0, row1):
+        target_row = (source_row - row0) + outline_cells
+        for source_col in range(col0, col1):
+            if mask.pixels[source_row][source_col]:
+                target_col = (source_col - col0) + outline_cells
+                rows[target_row][target_col] = 1
+
+    return MaskData(output_width, output_height, rows, mask.source_width, mask.source_height)
+
+
+def dilate_mask(rows: Sequence[bytearray], radius: int) -> list[bytearray]:
+    height = len(rows)
+    width = len(rows[0]) if rows else 0
+    output = [bytearray(width) for _row in range(height)]
+
+    offsets = [
+        (row_offset, col_offset)
+        for row_offset in range(-radius, radius + 1)
+        for col_offset in range(-radius, radius + 1)
+        if (row_offset * row_offset) + (col_offset * col_offset) <= radius * radius
+    ]
+
+    for row_index, row in enumerate(rows):
+        for col_index, value in enumerate(row):
+            if not value:
+                continue
+            for row_offset, col_offset in offsets:
+                target_row = row_index + row_offset
+                target_col = col_index + col_offset
+                if 0 <= target_row < height and 0 <= target_col < width:
+                    output[target_row][target_col] = 1
+
+    return output
+
+
 def sample_region(
     image: ImageData,
     x0: int,
@@ -447,53 +619,67 @@ def sample_region(
 
 
 def build_mesh(
-    mask: MaskData,
-    width_mm: float,
+    relief_mask: MaskData,
+    base_mask: MaskData,
+    size_x_mm: float,
+    size_y_mm: float,
     base_height_mm: float,
     relief_height_mm: float,
 ) -> tuple[Mesh, float]:
+    if relief_mask.width != base_mask.width or relief_mask.height != base_mask.height:
+        raise SystemExit("Internal error: relief mask and base mask dimensions do not match.")
+
     mesh = Mesh([])
-    height_mm = width_mm * (mask.height / mask.width)
-    top_z = base_height_mm + relief_height_mm
-    base_bottom_z = relief_height_mm
-    relief_bottom_z = 0.0
+    base_bottom_z = 0.0
+    base_top_z = base_height_mm
+    relief_top_z = base_height_mm + relief_height_mm
 
-    add_horizontal_rect(mesh, 0, 0, mask.width, mask.height, mask, width_mm, height_mm, top_z, up=True)
-    add_base_sides(mesh, width_mm, height_mm, base_bottom_z, top_z)
-
-    background = [bytearray(1 - value for value in row) for row in mask.pixels]
-    background_mask = MaskData(mask.width, mask.height, background, mask.source_width, mask.source_height)
-
-    for row0, row1, col0, col1 in iter_rectangles(background_mask.pixels):
+    for row0, row1, col0, col1 in iter_rectangles(base_mask.pixels):
         add_horizontal_rect(
             mesh,
             col0,
             row0,
             col1,
             row1,
-            background_mask,
-            width_mm,
-            height_mm,
+            base_mask,
+            size_x_mm,
+            size_y_mm,
             base_bottom_z,
             up=False,
         )
 
-    for row0, row1, col0, col1 in iter_rectangles(mask.pixels):
+    exposed_base = subtract_masks(base_mask, relief_mask)
+    for row0, row1, col0, col1 in iter_rectangles(exposed_base.pixels):
         add_horizontal_rect(
             mesh,
             col0,
             row0,
             col1,
             row1,
-            mask,
-            width_mm,
-            height_mm,
-            relief_bottom_z,
-            up=False,
+            exposed_base,
+            size_x_mm,
+            size_y_mm,
+            base_top_z,
+            up=True,
         )
 
-    add_relief_sides(mesh, mask, width_mm, height_mm, relief_bottom_z, base_bottom_z)
-    return mesh, height_mm
+    for row0, row1, col0, col1 in iter_rectangles(relief_mask.pixels):
+        add_horizontal_rect(
+            mesh,
+            col0,
+            row0,
+            col1,
+            row1,
+            relief_mask,
+            size_x_mm,
+            size_y_mm,
+            relief_top_z,
+            up=True,
+        )
+
+    add_mask_sides(mesh, base_mask, size_x_mm, size_y_mm, base_bottom_z, base_top_z)
+    add_mask_sides(mesh, relief_mask, size_x_mm, size_y_mm, base_top_z, relief_top_z)
+    return mesh, size_y_mm
 
 
 def add_horizontal_rect(
@@ -503,15 +689,15 @@ def add_horizontal_rect(
     col1: int,
     row1: int,
     mask: MaskData,
-    width_mm: float,
-    height_mm: float,
+    size_x_mm: float,
+    size_y_mm: float,
     z: float,
     up: bool,
 ) -> None:
-    x0 = col0 * width_mm / mask.width
-    x1 = col1 * width_mm / mask.width
-    y0 = height_mm - (row1 * height_mm / mask.height)
-    y1 = height_mm - (row0 * height_mm / mask.height)
+    x0 = col0 * size_x_mm / mask.width
+    x1 = col1 * size_x_mm / mask.width
+    y0 = size_y_mm - (row1 * size_y_mm / mask.height)
+    y1 = size_y_mm - (row0 * size_y_mm / mask.height)
 
     if up:
         mesh.add_quad((x0, y0, z), (x1, y0, z), (x1, y1, z), (x0, y1, z))
@@ -519,20 +705,21 @@ def add_horizontal_rect(
         mesh.add_quad((x0, y0, z), (x0, y1, z), (x1, y1, z), (x1, y0, z))
 
 
-def add_base_sides(mesh: Mesh, width_mm: float, height_mm: float, z0: float, z1: float) -> None:
-    mesh.add_quad((0.0, 0.0, z0), (0.0, 0.0, z1), (0.0, height_mm, z1), (0.0, height_mm, z0))
-    mesh.add_quad(
-        (width_mm, 0.0, z0),
-        (width_mm, height_mm, z0),
-        (width_mm, height_mm, z1),
-        (width_mm, 0.0, z1),
-    )
-    mesh.add_quad((0.0, 0.0, z0), (width_mm, 0.0, z0), (width_mm, 0.0, z1), (0.0, 0.0, z1))
-    mesh.add_quad(
-        (0.0, height_mm, z0),
-        (0.0, height_mm, z1),
-        (width_mm, height_mm, z1),
-        (width_mm, height_mm, z0),
+def subtract_masks(base_mask: MaskData, relief_mask: MaskData) -> MaskData:
+    rows: list[bytearray] = []
+    for base_row, relief_row in zip(base_mask.pixels, relief_mask.pixels):
+        rows.append(
+            bytearray(
+                1 if base_value and not relief_value else 0
+                for base_value, relief_value in zip(base_row, relief_row)
+            )
+        )
+    return MaskData(
+        base_mask.width,
+        base_mask.height,
+        rows,
+        base_mask.source_width,
+        base_mask.source_height,
     )
 
 
@@ -572,24 +759,24 @@ def find_runs(row: bytearray) -> Iterator[tuple[int, int]]:
             yield start, col
 
 
-def add_relief_sides(
+def add_mask_sides(
     mesh: Mesh,
     mask: MaskData,
-    width_mm: float,
-    height_mm: float,
+    size_x_mm: float,
+    size_y_mm: float,
     z0: float,
     z1: float,
 ) -> None:
     for row in range(mask.height):
-        y_top = height_mm - (row * height_mm / mask.height)
-        y_bottom = height_mm - ((row + 1) * height_mm / mask.height)
+        y_top = size_y_mm - (row * size_y_mm / mask.height)
+        y_bottom = size_y_mm - ((row + 1) * size_y_mm / mask.height)
 
         for col in range(mask.width):
             if not mask.pixels[row][col]:
                 continue
 
-            x0 = col * width_mm / mask.width
-            x1 = (col + 1) * width_mm / mask.width
+            x0 = col * size_x_mm / mask.width
+            x1 = (col + 1) * size_x_mm / mask.width
 
             if col == 0 or not mask.pixels[row][col - 1]:
                 mesh.add_quad((x0, y_bottom, z0), (x0, y_bottom, z1), (x0, y_top, z1), (x0, y_top, z0))
@@ -649,7 +836,7 @@ def write_ascii_stl(path: Path, mesh: Mesh) -> None:
 
 def generate_stamp(config: StampConfig) -> None:
     image = load_image(config.image_path)
-    mask = build_mask(
+    source_mask = build_mask(
         image=image,
         threshold=config.threshold,
         max_resolution=config.max_resolution,
@@ -657,21 +844,37 @@ def generate_stamp(config: StampConfig) -> None:
         invert=config.invert,
         mirror=config.mirror,
     )
+    masks = prepare_masks(
+        mask=source_mask,
+        base_mode=config.base_mode,
+        outline_mm=config.outline_mm,
+        stamp_height_mm=config.stamp_height_mm,
+    )
+    mm_per_cell = config.stamp_height_mm / masks.artwork_height_cells
+    size_x_mm = masks.base.width * mm_per_cell
+    size_y_mm = masks.base.height * mm_per_cell
     mesh, depth_mm = build_mesh(
-        mask=mask,
-        width_mm=config.width_mm,
+        relief_mask=masks.relief,
+        base_mask=masks.base,
+        size_x_mm=size_x_mm,
+        size_y_mm=size_y_mm,
         base_height_mm=config.base_height_mm,
         relief_height_mm=config.relief_height_mm,
     )
     write_stl(config.output_path, mesh, config.ascii_stl)
 
-    raised_cells = sum(sum(row) for row in mask.pixels)
+    raised_cells = sum(sum(row) for row in masks.relief.pixels)
+    base_cells = sum(sum(row) for row in masks.base.pixels)
     print(f"Config: {config.config_path}")
     print(f"Input: {config.image_path} ({image.width}x{image.height}px)")
-    print(f"Mesh grid: {mask.width}x{mask.height} cells, {raised_cells} raised")
+    print(f"Mesh grid: {masks.base.width}x{masks.base.height} cells, {raised_cells} raised, {base_cells} base")
+    print(f"Base mode: {config.base_mode}")
+    print(f"Stamp figure height: {config.stamp_height_mm:.2f} mm")
+    if config.base_mode != "image":
+        print(f"Outline: {masks.actual_outline_mm:.2f} mm ({masks.outline_cells} cells)")
     print(
         "Size: "
-        f"{config.width_mm:.2f} x {depth_mm:.2f} x "
+        f"{size_x_mm:.2f} x {depth_mm:.2f} x "
         f"{config.base_height_mm + config.relief_height_mm:.2f} mm"
     )
     print(f"Triangles: {len(mesh.triangles)}")

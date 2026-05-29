@@ -6,7 +6,7 @@ The stamp symbol is defined by the white area or areas in the input image. These
 
 ## Concept
 
-The generated stamp model is a 3D box with a defined height. On the bottom face of that box, the white regions from the input image are extruded outward to form the stamp symbol.
+The generated stamp model is a 3D body with a defined height. The body sits flat on the print bed, and the white regions from the input image are extruded upward to form the raised stamp symbol.
 
 In other words:
 
@@ -14,16 +14,16 @@ In other words:
 - White pixels: the stamp symbol.
 - Non-white pixels: background or empty space.
 - Output: a 3D printable stamp model.
-- Base shape: a rectangular box with a configurable height.
-- Stamp face: the white areas from the image extruded from the bottom of the box.
+- Base shape: configurable as the full image canvas, a tight rectangle around the white extents, or a contour-following body.
+- Stamp face: the white areas from the image extruded upward from the body.
 
 ## Intended Workflow
 
 1. Create a JSON config file for the input image.
 2. Detect the white areas in the image.
 3. Convert those white areas into 2D stamp geometry.
-4. Create a 3D box to act as the stamp body.
-5. Extrude the detected white areas from the bottom of the box.
+4. Create a 3D body to act as the stamp base.
+5. Extrude the detected white areas upward from the body.
 6. Export the result as a 3D model suitable for printing.
 
 ## Usage
@@ -52,7 +52,9 @@ Example:
 {
   "image": "stamp_1.png",
   "output": "stamp_1.stl",
-  "width_mm": 50,
+  "stamp_height_mm": 50,
+  "base_mode": "contour",
+  "outline_mm": 1,
   "base_height_mm": 6,
   "relief_height_mm": 2,
   "threshold": 245,
@@ -66,8 +68,10 @@ Example:
 
 - `image`: input image path.
 - `output`: output STL path. If omitted, the image name is reused with `.stl`.
-- `width_mm`: physical stamp width.
-- `base_height_mm`: height of the rectangular stamp body.
+- `stamp_height_mm`: physical height of the detected white stamp figure on the Y axis. The outline is added outside this size.
+- `base_mode`: `image` uses the full image canvas, `extents` uses a tight rectangle around the white area, and `contour` follows the white contour.
+- `outline_mm`: margin around the detected white area for `extents` or `contour` mode.
+- `base_height_mm`: height of the stamp body.
 - `relief_height_mm`: height of the raised stamping geometry.
 - `threshold`: grayscale value from 0 to 255 treated as white.
 - `max_resolution`: maximum mesh grid cells on the longest image side. Use `0` to keep the original image resolution.
@@ -78,4 +82,4 @@ Example:
 
 ## Goal
 
-The final printed object should work as a physical stamp: the raised geometry on the bottom forms the visible stamped symbol when pressed into ink, clay, or another stampable surface.
+The final printed object should work as a physical stamp: the raised geometry forms the visible stamped symbol when pressed into ink, clay, or another stampable surface.
